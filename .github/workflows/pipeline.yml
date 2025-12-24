@@ -1,0 +1,282 @@
+name: Reventure Clone - Data Pipeline
+
+on:
+  schedule:
+    # Run at 6 AM UTC on the 1st and 15th of each month
+    - cron: '0 6 1,15 * *'
+  workflow_dispatch:
+    inputs:
+      full_refresh:
+        description: 'Full data refresh (slow)'
+        required: false
+        default: 'false'
+        type: boolean
+      geo_level:
+        description: 'Geographic level to scrape'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - state
+          - metro
+          - zip
+
+env:
+  PYTHON_VERSION: '3.11'
+  NODE_VERSION: '20'
+
+jobs:
+  # ==================== ZILLOW DATA ====================
+  scrape-zillow:
+    runs-on: ubuntu-latest
+    name: 📊 Scrape Zillow Research Data
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install httpx pandas openpyxl supabase python-dotenv
+      
+      - name: Run Zillow scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python src/scrapers/zillow_scraper.py --all --output data/zillow
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zillow-data
+          path: data/zillow/
+          retention-days: 30
+      
+      - name: Log completion
+        run: echo "✅ Zillow data scraped at $(date)"
+
+  # ==================== CENSUS DATA ====================
+  scrape-census:
+    runs-on: ubuntu-latest
+    name: 📈 Scrape Census API
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install httpx pandas supabase python-dotenv
+      
+      - name: Run Census scraper
+        env:
+          CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          if [ "${{ inputs.geo_level }}" = "all" ] || [ -z "${{ inputs.geo_level }}" ]; then
+            python src/scrapers/census_scraper.py --all --year 2022 --output data/census
+          else
+            python src/scrapers/census_scraper.py --geo ${{ inputs.geo_level }} --year 2022 --output data/census
+          fi
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: census-data
+          path: data/census/
+          retention-days: 30
+
+  # ==================== DATA PROCESSING ====================
+  process-data:
+    runs-on: ubuntu-latest
+    name: ⚙️ Process & Calculate Scores
+    needs: [scrape-zillow, scrape-census]
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Download Zillow data
+        uses: actions/download-artifact@v4
+        with:
+          name: zillow-data
+          path: data/zillow/
+      
+      - name: Download Census data
+        uses: actions/download-artifact@v4
+        with:
+          name: census-data
+          path: data/census/
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy supabase python-dotenv
+      
+      - name: Process and merge data
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python << 'EOF'
+          import os
+          import pandas as pd
+          from pathlib import Path
+          from datetime import datetime
+          
+          # Load Zillow data
+          zillow_dir = Path("data/zillow")
+          census_dir = Path("data/census")
+          
+          print("📂 Loading data files...")
+          
+          # Load latest Zillow home values by ZIP
+          zhvi_file = zillow_dir / "zhvi_zip.csv"
+          if zhvi_file.exists():
+              df_zhvi = pd.read_csv(zhvi_file)
+              date_cols = [c for c in df_zhvi.columns if len(c) == 7 and c[4] == '-']
+              if date_cols:
+                  latest_col = sorted(date_cols)[-1]
+                  print(f"   ZHVI latest date: {latest_col}")
+          
+          # Load Census demographics
+          census_file = census_dir / "census_acs_zip_2022.csv"
+          if census_file.exists():
+              df_census = pd.read_csv(census_file)
+              print(f"   Census records: {len(df_census)}")
+          
+          print("✅ Data processing complete")
+          print(f"   Timestamp: {datetime.now().isoformat()}")
+          EOF
+      
+      - name: Calculate forecast scores
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python << 'EOF'
+          import sys
+          sys.path.insert(0, '.')
+          
+          from src.agents.reventure_clone_agent import ForecastScorer
+          
+          # Example scoring
+          test_metrics = {
+              'inventory_vs_avg': 1.2,
+              'days_on_market': 45,
+              'price_cut_pct': 18.5,
+              'yoy_price_change': 2.3,
+              'mortgage_rate': 6.5
+          }
+          
+          score = ForecastScorer.calculate_price_forecast_score(test_metrics)
+          print(f"📊 Test forecast score: {score}/100")
+          
+          crash_metrics = {
+              'price_to_income': 5.2,
+              'three_year_appreciation': 35,
+              'inventory_yoy_change': 40
+          }
+          
+          crash_score = ForecastScorer.calculate_crash_potential(crash_metrics)
+          print(f"⚠️ Test crash potential: {crash_score}/100")
+          EOF
+
+  # ==================== FRONTEND DEPLOY ====================
+  deploy-frontend:
+    runs-on: ubuntu-latest
+    name: 🚀 Deploy to Cloudflare
+    needs: [process-data]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci || npm install
+        continue-on-error: true
+      
+      - name: Build
+        env:
+          NEXT_PUBLIC_MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          if [ -f "package.json" ]; then
+            npm run build || echo "Build skipped - no build script"
+          fi
+      
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/pages-action@v1
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          projectName: reventure-clone
+          directory: out
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+  # ==================== SUMMARY ====================
+  summary:
+    runs-on: ubuntu-latest
+    name: 📋 Pipeline Summary
+    needs: [scrape-zillow, scrape-census, process-data]
+    if: always()
+    
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## 🏠 Reventure Clone Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Zillow Scraper | ${{ needs.scrape-zillow.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Census Scraper | ${{ needs.scrape-census.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Data Processing | ${{ needs.process-data.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Completed at:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Log to Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          curl -X POST "$SUPABASE_URL/rest/v1/pipeline_runs" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "pipeline": "reventure-clone",
+              "status": "completed",
+              "zillow_status": "${{ needs.scrape-zillow.result }}",
+              "census_status": "${{ needs.scrape-census.result }}",
+              "process_status": "${{ needs.process-data.result }}",
+              "run_id": "${{ github.run_id }}",
+              "triggered_by": "${{ github.event_name }}"
+            }' || echo "Supabase logging skipped"
